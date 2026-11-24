@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
+use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
@@ -618,38 +619,176 @@ async fn run_vnc(mut socket: WebSocket, session: Arc<RemoteSession>, state: Arc<
         Duration::from_secs(10),
         tokio::net::TcpStream::connect((session.target.host.as_str(), session.target.port)),
     );
-    let tcp = tokio::select! {biased; _=session.cancelled()=>return,result=connect=>match result{Ok(Ok(t))=>t,_=>{session.transition("failed");let _=crate::http::send_ws_message(&mut socket, Message::Close(Some(axum::extract::ws::CloseFrame{code:1011,reason:"VNC target connection failed".into()}))).await;return;}}};
-    let _ = tcp.set_nodelay(true);
-    let (mut reader, mut writer) = tcp.into_split();
-    let mut bytes = vec![0u8; 65536];
-    let greeting_deadline = tokio::time::sleep(Duration::from_secs(10));
-    tokio::pin!(greeting_deadline);
-    let mut greeting_remaining = 12usize; // RFB starts with a 12-byte server version banner.
-    let mut lease = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        if *session.cancel.borrow() {
-            break;
-        }
-        tokio::select! {
-            _=session.cancelled()=>break,
-            _=&mut greeting_deadline, if greeting_remaining != 0 => {
-                *session.error.lock().unwrap() = Some("VNC target did not send a complete greeting".into());
+    let tcp = tokio::select! {
+        biased;
+        _ = session.cancelled() => return,
+        result = connect => match result {
+            Ok(Ok(tcp)) => tcp,
+            _ => {
                 session.transition("failed");
-                break;
-            },
-            _=lease.tick()=>{if state.access.resolve(session.owner.session_id,session.owner.mode).is_err(){break;}},
-            result=reader.read(&mut bytes)=>match result {
-                Ok(0)|Err(_)=>break,
-                Ok(n)=>{
-                    if greeting_remaining != 0 {
-                        greeting_remaining = greeting_remaining.saturating_sub(n);
-                        if greeting_remaining == 0 { session.transition("active"); }
-                    }
-                    if tokio::time::timeout(Duration::from_secs(15),socket.send(Message::Binary(bytes[..n].to_vec().into()))).await.map_or(true,|r|r.is_err()){break;}
+                let _ = crate::http::send_ws_message(&mut socket, Message::Close(Some(axum::extract::ws::CloseFrame { code:1011, reason:"VNC target connection failed".into() }))).await;
+                return;
+            }
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+    {
+        let active = session.clone();
+        let operation = relay_vnc_bytes(&mut socket, tcp, move || active.transition("active"));
+        tokio::pin!(operation);
+        let mut lease = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                _ = session.cancelled() => break,
+                _ = lease.tick() => if state.access.resolve(session.owner.session_id, session.owner.mode).is_err() { break; },
+                result = &mut operation => {
+                    if let Err(reason) = result { *session.error.lock().unwrap() = Some(reason.into()); session.transition("failed"); }
+                    break;
                 }
-            },
-            message=socket.recv()=>match message{Some(Ok(Message::Binary(data))) if greeting_remaining == 0 =>{if tokio::time::timeout(Duration::from_secs(15),writer.write_all(&data)).await.map_or(true,|r|r.is_err()){break;}},Some(Ok(Message::Ping(p)))=>{if crate::http::send_ws_message(&mut socket, Message::Pong(p)).await.is_err(){break;}},_=>break}
+            }
         }
     }
     let _ = crate::http::send_ws_message(&mut socket, Message::Close(None)).await;
+}
+
+async fn relay_vnc_bytes<T>(
+    socket: &mut WebSocket,
+    mut target: T,
+    ready: impl FnOnce(),
+) -> Result<(), &'static str>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut greeting = [0; 12];
+    tokio::time::timeout(Duration::from_secs(10), target.read_exact(&mut greeting))
+        .await
+        .map_err(|_| "VNC greeting timed out")?
+        .map_err(|_| "VNC greeting incomplete")?;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        socket.send(Message::Binary(greeting.to_vec().into())),
+    )
+    .await
+    .map_err(|_| "VNC browser write timed out")?
+    .map_err(|_| "VNC browser disconnected")?;
+    ready();
+    let (mut outgoing, mut incoming) = socket.split();
+    let (mut read, mut write) = tokio::io::split(target);
+    let (pongs, mut replies) = tokio::sync::mpsc::channel(8);
+    let to_browser = async {
+        let mut buffer = [0; 65536];
+        loop {
+            let message = tokio::select! {
+                reply = replies.recv() => match reply { Some(bytes) => Message::Pong(bytes), None => return Ok(()) },
+                result = read.read(&mut buffer) => match result {
+                    Ok(0) => return Ok(()),
+                    Ok(count) => Message::Binary(buffer[..count].to_vec().into()),
+                    Err(_) => return Err("VNC target disconnected"),
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(15), outgoing.send(message))
+                .await
+                .map_err(|_| "VNC browser write timed out")?
+                .map_err(|_| "VNC browser disconnected")?;
+        }
+    };
+    let to_target = async {
+        while let Some(message) = incoming.next().await {
+            match message {
+                Ok(Message::Binary(bytes)) => {
+                    tokio::time::timeout(Duration::from_secs(15), write.write_all(&bytes))
+                        .await
+                        .map_err(|_| "VNC target write timed out")?
+                        .map_err(|_| "VNC target disconnected")?;
+                }
+                Ok(Message::Ping(bytes)) => {
+                    tokio::time::timeout(Duration::from_secs(10), pongs.send(bytes))
+                        .await
+                        .map_err(|_| "VNC pong queue timed out")?
+                        .map_err(|_| "VNC browser disconnected")?;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => return Ok(()),
+                _ => return Err("invalid VNC stream frame"),
+            }
+        }
+        Ok(())
+    };
+    tokio::select! { result=to_browser=>result, result=to_target=>result }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn stalled_video_output_does_not_block_browser_input() {
+        let (target, peer) = tokio::io::duplex(128 * 1024);
+        let target = Arc::new(std::sync::Mutex::new(Some(target)));
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let target = target.lock().unwrap().take().unwrap();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let _ = relay_vnc_bytes(&mut socket, target, || {}).await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let (mut read, mut write) = tokio::io::split(peer);
+        write.write_all(b"RFB 003.008\n").await.unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap().into_data(),
+            b"RFB 003.008\n".as_slice()
+        );
+        let progress = Arc::new(AtomicUsize::new(0));
+        let count = progress.clone();
+        let writer = tokio::spawn(async move {
+            let block = vec![7; 65536];
+            for _ in 0..1024 {
+                if write.write_all(&block).await.is_err() {
+                    break;
+                }
+                count.fetch_add(block.len(), Ordering::Relaxed);
+            }
+        });
+        let mut last = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = progress.load(Ordering::Relaxed);
+            if now > 0 && now == last {
+                break;
+            }
+            last = now;
+        }
+        assert!(
+            progress.load(Ordering::Relaxed) < 64 * 1024 * 1024,
+            "video did not reach backpressure"
+        );
+        // Do not read video. The opposite pump must still deliver this command.
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                b"input".to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        let mut input = [0; 5];
+        tokio::time::timeout(Duration::from_secs(1), read.read_exact(&mut input))
+            .await
+            .expect("reverse direction blocked behind video")
+            .unwrap();
+        assert_eq!(&input, b"input");
+        drop(client);
+        writer.abort();
+        server.abort();
+    }
 }
